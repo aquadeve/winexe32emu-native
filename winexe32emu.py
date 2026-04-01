@@ -290,13 +290,34 @@ class WinAPIHandler:
     # Windows message constants
     WM_CREATE = 0x0001
     WM_DESTROY = 0x0002
+    WM_SIZE = 0x0005
+    WM_SETTEXT = 0x000C
+    WM_GETTEXT = 0x000D
     WM_PAINT = 0x000F
     WM_CLOSE = 0x0010
     WM_QUIT = 0x0012
+    WM_ERASEBKGND = 0x0014
     WM_SHOWWINDOW = 0x0018
+    WM_ACTIVATEAPP = 0x001C
+    WM_SETFOCUS = 0x0007
+    WM_KILLFOCUS = 0x0008
+    WM_ENABLE = 0x000A
+    WM_SETREDRAW = 0x000B
+    WM_COMMAND = 0x0111
+    WM_TIMER = 0x0113
+    WM_HSCROLL = 0x0114
+    WM_VSCROLL = 0x0115
+    WM_MOUSEMOVE = 0x0200
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    WM_RBUTTONDOWN = 0x0204
+    WM_RBUTTONUP = 0x0205
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
     WM_CHAR = 0x0102
+    WM_SYSCOMMAND = 0x0112
+    WM_NCCREATE = 0x0081
+    WM_NCDESTROY = 0x0082
     
     def __init__(self, emulator, gui=None):
         self.emu = emulator
@@ -312,6 +333,47 @@ class WinAPIHandler:
         self.message_queue = []
         self.painted_windows = set()  # Windows that received WM_PAINT
         self.quit_requested = False
+        
+        # Thread-Local Storage
+        self.tls_slots = {}  # slot_index -> value
+        self.next_tls_index = 0
+        
+        # Critical sections (tracked as addresses)
+        self.critical_sections = set()
+        
+        # Events
+        self.events = {}  # handle -> {'manual_reset': bool, 'signaled': bool, 'name': str}
+        
+        # Mutexes
+        self.mutexes = {}  # handle -> {'name': str}
+        
+        # Threads
+        self.threads = {}  # handle -> {'func': addr, 'param': value, 'id': int}
+        self.next_thread_id = 100
+        
+        # Timers
+        self.timers = {}  # timer_id -> {'hwnd': hwnd, 'elapse': ms, 'callback': addr}
+        self.next_timer_id = 1
+        
+        # GDI objects
+        self.gdi_objects = {}  # handle -> {'type': str, ...}
+        self.next_gdi_handle = 0x80000100
+        self.dc_objects = {}  # dc_handle -> {'pen': handle, 'brush': handle, 'font': handle, ...}
+        self.dc_positions = {}  # dc_handle -> (x, y) current position
+        
+        # File search handles
+        self.find_handles = {}  # handle -> {'pattern': str, 'files': list, 'index': int}
+        
+        # Environment strings
+        self._env_strings_addr = 0
+        self._env_strings_w_addr = 0
+        
+        # Console mode
+        self._console_mode = 0x0003  # ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT
+        self._last_error = 0
+        
+        # Window long storage for SetWindowLongA/GetWindowLongA
+        self.window_long = {}  # (hwnd, index) -> value
         
         # MSVCRT global variable memory addresses (lazy init)
         self._fmode_addr = 0
@@ -340,6 +402,16 @@ class WinAPIHandler:
             '__security_check_cookie': self.api__security_check_cookie,
             '__iob_func': self.api__iob_func,
             '__acrt_iob_func': self.api__acrt_iob_func,
+            '__p__environ': self.api__p__environ,
+            '__p__wenviron': self.api__p__wenviron,
+            '__setusermatherr': self.api__setusermatherr,
+            '_crt_atexit': self.api_crt_atexit,
+            '_initialize_narrow_environment': self.api_initialize_narrow_environment,
+            '_get_initial_narrow_environment': self.api_get_initial_narrow_environment,
+            '_set_new_mode': self.api_set_new_mode,
+            '_controlfp_s': self.api_controlfp_s,
+            '_configthreadlocale': self.api_configthreadlocale,
+            '_EH_prolog': self.api_EH_prolog,
         }
     
     def get_api_handler(self, func_name):
@@ -1264,7 +1336,1579 @@ class WinAPIHandler:
         
         return len(result) + 1
     
-    # USER32.DLL APIs
+    # ==================== NEW KERNEL32 APIs ====================
+    
+    def MultiByteToWideChar(self, args):
+        """MultiByteToWideChar emulation"""
+        CodePage = args[0]
+        dwFlags = args[1]
+        lpMultiByteStr = args[2]
+        cbMultiByte = args[3]
+        lpWideCharStr = args[4]
+        cchWideChar = args[5]
+        
+        try:
+            if cbMultiByte == -1 or cbMultiByte == 0xFFFFFFFF:
+                src = self.read_string(lpMultiByteStr)
+                src += '\x00'
+            else:
+                data = self.emu.uc.mem_read(lpMultiByteStr, cbMultiByte)
+                src = data.decode('utf-8', errors='replace')
+            
+            wide_data = src.encode('utf-16-le')
+            wide_chars = len(wide_data) // 2
+            
+            if cchWideChar == 0:
+                log.debug(f"MultiByteToWideChar() -> {wide_chars} (query)")
+                return wide_chars
+            
+            if lpWideCharStr != 0:
+                write_len = min(len(wide_data), cchWideChar * 2)
+                self.emu.uc.mem_write(lpWideCharStr, wide_data[:write_len])
+            
+            log.debug(f"MultiByteToWideChar() -> {wide_chars}")
+            return wide_chars
+        except Exception as e:
+            log.error(f"MultiByteToWideChar error: {e}")
+            return 0
+    
+    def WideCharToMultiByte(self, args):
+        """WideCharToMultiByte emulation"""
+        CodePage = args[0]
+        dwFlags = args[1]
+        lpWideCharStr = args[2]
+        cchWideChar = args[3]
+        lpMultiByteStr = args[4]
+        cbMultiByte = args[5]
+        lpDefaultChar = args[6]
+        lpUsedDefaultChar = args[7]
+        
+        try:
+            if cchWideChar == -1 or cchWideChar == 0xFFFFFFFF:
+                src = self.read_wide_string(lpWideCharStr)
+                src += '\x00'
+            else:
+                data = self.emu.uc.mem_read(lpWideCharStr, cchWideChar * 2)
+                src = data.decode('utf-16-le', errors='replace')
+            
+            mb_data = src.encode('utf-8', errors='replace')
+            
+            if cbMultiByte == 0:
+                log.debug(f"WideCharToMultiByte() -> {len(mb_data)} (query)")
+                return len(mb_data)
+            
+            if lpMultiByteStr != 0:
+                write_len = min(len(mb_data), cbMultiByte)
+                self.emu.uc.mem_write(lpMultiByteStr, mb_data[:write_len])
+            
+            if lpUsedDefaultChar != 0:
+                self.emu.uc.mem_write(lpUsedDefaultChar, struct.pack('<I', 0))
+            
+            log.debug(f"WideCharToMultiByte() -> {len(mb_data)}")
+            return len(mb_data)
+        except Exception as e:
+            log.error(f"WideCharToMultiByte error: {e}")
+            return 0
+    
+    def InitializeCriticalSection(self, args):
+        """InitializeCriticalSection emulation"""
+        lpCriticalSection = args[0]
+        log.debug(f"InitializeCriticalSection(0x{lpCriticalSection:08x})")
+        self.critical_sections.add(lpCriticalSection)
+        return 0
+    
+    def InitializeCriticalSectionAndSpinCount(self, args):
+        """InitializeCriticalSectionAndSpinCount emulation"""
+        lpCriticalSection = args[0]
+        dwSpinCount = args[1]
+        log.debug(f"InitializeCriticalSectionAndSpinCount(0x{lpCriticalSection:08x}, {dwSpinCount})")
+        self.critical_sections.add(lpCriticalSection)
+        return 1  # Success
+    
+    def InitializeCriticalSectionEx(self, args):
+        """InitializeCriticalSectionEx emulation"""
+        lpCriticalSection = args[0]
+        dwSpinCount = args[1]
+        Flags = args[2]
+        log.debug(f"InitializeCriticalSectionEx(0x{lpCriticalSection:08x})")
+        self.critical_sections.add(lpCriticalSection)
+        return 1  # Success
+    
+    def EnterCriticalSection(self, args):
+        """EnterCriticalSection emulation"""
+        lpCriticalSection = args[0]
+        log.debug(f"EnterCriticalSection(0x{lpCriticalSection:08x})")
+        return 0
+    
+    def LeaveCriticalSection(self, args):
+        """LeaveCriticalSection emulation"""
+        lpCriticalSection = args[0]
+        log.debug(f"LeaveCriticalSection(0x{lpCriticalSection:08x})")
+        return 0
+    
+    def DeleteCriticalSection(self, args):
+        """DeleteCriticalSection emulation"""
+        lpCriticalSection = args[0]
+        log.debug(f"DeleteCriticalSection(0x{lpCriticalSection:08x})")
+        self.critical_sections.discard(lpCriticalSection)
+        return 0
+    
+    def TlsAlloc(self, args):
+        """TlsAlloc emulation"""
+        index = self.next_tls_index
+        self.next_tls_index += 1
+        self.tls_slots[index] = 0
+        log.debug(f"TlsAlloc() -> {index}")
+        return index
+    
+    def TlsFree(self, args):
+        """TlsFree emulation"""
+        dwTlsIndex = args[0]
+        log.debug(f"TlsFree({dwTlsIndex})")
+        if dwTlsIndex in self.tls_slots:
+            del self.tls_slots[dwTlsIndex]
+        return 1
+    
+    def TlsGetValue(self, args):
+        """TlsGetValue emulation"""
+        dwTlsIndex = args[0]
+        value = self.tls_slots.get(dwTlsIndex, 0)
+        log.debug(f"TlsGetValue({dwTlsIndex}) -> 0x{value:08x}")
+        return value
+    
+    def TlsSetValue(self, args):
+        """TlsSetValue emulation"""
+        dwTlsIndex = args[0]
+        lpTlsValue = args[1]
+        log.debug(f"TlsSetValue({dwTlsIndex}, 0x{lpTlsValue:08x})")
+        self.tls_slots[dwTlsIndex] = lpTlsValue
+        return 1
+    
+    def VirtualProtect(self, args):
+        """VirtualProtect emulation"""
+        lpAddress = args[0]
+        dwSize = args[1]
+        flNewProtect = args[2]
+        lpflOldProtect = args[3]
+        
+        log.debug(f"VirtualProtect(0x{lpAddress:08x}, 0x{dwSize:x}, 0x{flNewProtect:x})")
+        
+        if lpflOldProtect != 0:
+            self.emu.uc.mem_write(lpflOldProtect, struct.pack('<I', 0x40))  # PAGE_EXECUTE_READWRITE
+        
+        return 1  # Success
+    
+    def VirtualQuery(self, args):
+        """VirtualQuery emulation"""
+        lpAddress = args[0]
+        lpBuffer = args[1]
+        dwLength = args[2]
+        
+        log.debug(f"VirtualQuery(0x{lpAddress:08x})")
+        
+        if lpBuffer != 0 and dwLength >= 28:
+            # MEMORY_BASIC_INFORMATION structure
+            info = struct.pack('<IIIIIII',
+                lpAddress & 0xFFFFF000,  # BaseAddress
+                lpAddress & 0xFFFFF000,  # AllocationBase
+                0x40,                     # AllocationProtect (PAGE_EXECUTE_READWRITE)
+                0x1000,                   # RegionSize
+                0x1000,                   # State (MEM_COMMIT)
+                0x40,                     # Protect
+                0x20000,                  # Type (MEM_PRIVATE)
+            )
+            self.emu.uc.mem_write(lpBuffer, info)
+        
+        return 28  # Size of MEMORY_BASIC_INFORMATION
+    
+    def VirtualLock(self, args):
+        """VirtualLock emulation"""
+        log.debug("VirtualLock()")
+        return 1
+    
+    def VirtualUnlock(self, args):
+        """VirtualUnlock emulation"""
+        log.debug("VirtualUnlock()")
+        return 1
+    
+    def QueryPerformanceFrequency(self, args):
+        """QueryPerformanceFrequency emulation"""
+        lpFrequency = args[0]
+        
+        if lpFrequency != 0:
+            self.emu.uc.mem_write(lpFrequency, struct.pack('<Q', 1000000))  # 1MHz
+        
+        log.debug("QueryPerformanceFrequency()")
+        return 1
+    
+    def InterlockedIncrement(self, args):
+        """InterlockedIncrement emulation"""
+        lpAddend = args[0]
+        try:
+            value = struct.unpack('<i', self.emu.uc.mem_read(lpAddend, 4))[0]
+            value += 1
+            self.emu.uc.mem_write(lpAddend, struct.pack('<i', value))
+            return value & 0xFFFFFFFF
+        except:
+            return 1
+    
+    def InterlockedDecrement(self, args):
+        """InterlockedDecrement emulation"""
+        lpAddend = args[0]
+        try:
+            value = struct.unpack('<i', self.emu.uc.mem_read(lpAddend, 4))[0]
+            value -= 1
+            self.emu.uc.mem_write(lpAddend, struct.pack('<i', value))
+            return value & 0xFFFFFFFF
+        except:
+            return 0
+    
+    def HeapReAlloc(self, args):
+        """HeapReAlloc emulation"""
+        hHeap = args[0]
+        dwFlags = args[1]
+        lpMem = args[2]
+        dwBytes = args[3]
+        
+        addr = self.emu.heap_alloc(dwBytes)
+        # Copy old data if possible
+        if lpMem != 0:
+            try:
+                old_data = self.emu.uc.mem_read(lpMem, min(dwBytes, 4096))
+                self.emu.uc.mem_write(addr, bytes(old_data))
+            except:
+                pass
+        
+        log.debug(f"HeapReAlloc(0x{lpMem:08x}, {dwBytes}) -> 0x{addr:08x}")
+        return addr
+    
+    def HeapSize(self, args):
+        """HeapSize emulation"""
+        hHeap = args[0]
+        dwFlags = args[1]
+        lpMem = args[2]
+        log.debug(f"HeapSize(0x{lpMem:08x})")
+        return 0x1000  # Return a default size
+    
+    def HeapSetInformation(self, args):
+        """HeapSetInformation emulation"""
+        log.debug("HeapSetInformation()")
+        return 1
+    
+    def HeapValidate(self, args):
+        """HeapValidate emulation"""
+        log.debug("HeapValidate()")
+        return 1
+    
+    def HeapCompact(self, args):
+        """HeapCompact emulation"""
+        log.debug("HeapCompact()")
+        return 0x10000
+    
+    def HeapDestroy(self, args):
+        """HeapDestroy emulation"""
+        log.debug("HeapDestroy()")
+        return 1
+    
+    def FindFirstFileA(self, args):
+        """FindFirstFileA emulation"""
+        lpFileName = args[0]
+        lpFindFileData = args[1]
+        
+        filename = self.read_string(lpFileName)
+        log.debug(f"FindFirstFileA(\"{filename}\")")
+        
+        # Fill WIN32_FIND_DATAA with empty data
+        if lpFindFileData != 0:
+            self.emu.uc.mem_write(lpFindFileData, b'\x00' * 320)
+        
+        return 0xFFFFFFFF  # INVALID_HANDLE_VALUE - no files found
+    
+    def FindNextFileA(self, args):
+        """FindNextFileA emulation"""
+        hFindFile = args[0]
+        lpFindFileData = args[1]
+        log.debug(f"FindNextFileA(0x{hFindFile:x})")
+        return 0  # No more files
+    
+    def FindClose(self, args):
+        """FindClose emulation"""
+        hFindFile = args[0]
+        log.debug(f"FindClose(0x{hFindFile:x})")
+        return 1
+    
+    def FindFirstFileW(self, args):
+        """FindFirstFileW emulation"""
+        lpFileName = args[0]
+        lpFindFileData = args[1]
+        filename = self.read_wide_string(lpFileName)
+        log.debug(f"FindFirstFileW(\"{filename}\")")
+        if lpFindFileData != 0:
+            self.emu.uc.mem_write(lpFindFileData, b'\x00' * 592)
+        return 0xFFFFFFFF  # INVALID_HANDLE_VALUE
+    
+    def FindNextFileW(self, args):
+        """FindNextFileW emulation"""
+        log.debug("FindNextFileW()")
+        return 0
+    
+    def CreateDirectoryA(self, args):
+        """CreateDirectoryA emulation"""
+        lpPathName = args[0]
+        lpSecurityAttributes = args[1]
+        dirname = self.read_string(lpPathName)
+        log.debug(f"CreateDirectoryA(\"{dirname}\")")
+        return 1  # Success
+    
+    def CreateDirectoryW(self, args):
+        """CreateDirectoryW emulation"""
+        lpPathName = args[0]
+        dirname = self.read_wide_string(lpPathName)
+        log.debug(f"CreateDirectoryW(\"{dirname}\")")
+        return 1
+    
+    def RemoveDirectoryA(self, args):
+        """RemoveDirectoryA emulation"""
+        lpPathName = args[0]
+        dirname = self.read_string(lpPathName)
+        log.debug(f"RemoveDirectoryA(\"{dirname}\")")
+        return 1
+    
+    def DeleteFileA(self, args):
+        """DeleteFileA emulation"""
+        lpFileName = args[0]
+        filename = self.read_string(lpFileName)
+        log.debug(f"DeleteFileA(\"{filename}\")")
+        return 1  # Success
+    
+    def DeleteFileW(self, args):
+        """DeleteFileW emulation"""
+        lpFileName = args[0]
+        filename = self.read_wide_string(lpFileName)
+        log.debug(f"DeleteFileW(\"{filename}\")")
+        return 1
+    
+    def MoveFileA(self, args):
+        """MoveFileA emulation"""
+        lpExistingFileName = args[0]
+        lpNewFileName = args[1]
+        log.debug("MoveFileA()")
+        return 1
+    
+    def GetFileType(self, args):
+        """GetFileType emulation"""
+        hFile = args[0]
+        log.debug(f"GetFileType(0x{hFile:x})")
+        # FILE_TYPE_CHAR for console handles
+        if hFile in [0x10, 0x11, 0x12]:
+            return 0x0002  # FILE_TYPE_CHAR
+        return 0x0001  # FILE_TYPE_DISK
+    
+    def SetFilePointer(self, args):
+        """SetFilePointer emulation"""
+        hFile = args[0]
+        lDistanceToMove = args[1]
+        lpDistanceToMoveHigh = args[2]
+        dwMoveMethod = args[3]
+        log.debug(f"SetFilePointer(0x{hFile:x}, {lDistanceToMove})")
+        return 0  # Current position
+    
+    def FlushFileBuffers(self, args):
+        """FlushFileBuffers emulation"""
+        hFile = args[0]
+        log.debug(f"FlushFileBuffers(0x{hFile:x})")
+        return 1
+    
+    def SetEndOfFile(self, args):
+        """SetEndOfFile emulation"""
+        hFile = args[0]
+        log.debug(f"SetEndOfFile(0x{hFile:x})")
+        return 1
+    
+    def LockFile(self, args):
+        """LockFile emulation"""
+        log.debug("LockFile()")
+        return 1
+    
+    def UnlockFile(self, args):
+        """UnlockFile emulation"""
+        log.debug("UnlockFile()")
+        return 1
+    
+    def GetFullPathNameA(self, args):
+        """GetFullPathNameA emulation"""
+        lpFileName = args[0]
+        nBufferLength = args[1]
+        lpBuffer = args[2]
+        lpFilePart = args[3]
+        
+        filename = self.read_string(lpFileName)
+        # Prefix with C:\ if not absolute
+        if not filename.startswith('C:') and not filename.startswith('\\'):
+            full_path = "C:\\" + filename
+        else:
+            full_path = filename
+        
+        if lpBuffer != 0 and len(full_path) < nBufferLength:
+            self.emu.uc.mem_write(lpBuffer, full_path.encode('utf-8') + b'\x00')
+        
+        # Set file part pointer
+        if lpFilePart != 0:
+            last_sep = full_path.rfind('\\')
+            if last_sep >= 0:
+                file_part_offset = last_sep + 1
+                self.emu.uc.mem_write(lpFilePart, struct.pack('<I', lpBuffer + file_part_offset))
+        
+        log.debug(f"GetFullPathNameA(\"{filename}\") -> \"{full_path}\"")
+        return len(full_path)
+    
+    def GetFullPathNameW(self, args):
+        """GetFullPathNameW emulation"""
+        lpFileName = args[0]
+        nBufferLength = args[1]
+        lpBuffer = args[2]
+        lpFilePart = args[3]
+        
+        filename = self.read_wide_string(lpFileName)
+        if not filename.startswith('C:') and not filename.startswith('\\'):
+            full_path = "C:\\" + filename
+        else:
+            full_path = filename
+        
+        if lpBuffer != 0 and len(full_path) < nBufferLength:
+            self.emu.uc.mem_write(lpBuffer, full_path.encode('utf-16-le') + b'\x00\x00')
+        
+        log.debug(f"GetFullPathNameW(\"{filename}\")")
+        return len(full_path)
+    
+    def GetCurrentDirectoryA(self, args):
+        """GetCurrentDirectoryA emulation"""
+        nBufferLength = args[0]
+        lpBuffer = args[1]
+        
+        cur_dir = "C:\\"
+        if lpBuffer != 0 and len(cur_dir) < nBufferLength:
+            self.emu.uc.mem_write(lpBuffer, cur_dir.encode('utf-8') + b'\x00')
+        
+        log.debug(f"GetCurrentDirectoryA() -> \"{cur_dir}\"")
+        return len(cur_dir)
+    
+    def GetCurrentDirectoryW(self, args):
+        """GetCurrentDirectoryW emulation"""
+        nBufferLength = args[0]
+        lpBuffer = args[1]
+        
+        cur_dir = "C:\\"
+        if lpBuffer != 0 and len(cur_dir) < nBufferLength:
+            self.emu.uc.mem_write(lpBuffer, cur_dir.encode('utf-16-le') + b'\x00\x00')
+        
+        log.debug(f"GetCurrentDirectoryW() -> \"{cur_dir}\"")
+        return len(cur_dir)
+    
+    def SetCurrentDirectoryA(self, args):
+        """SetCurrentDirectoryA emulation"""
+        lpPathName = args[0]
+        dirname = self.read_string(lpPathName)
+        log.debug(f"SetCurrentDirectoryA(\"{dirname}\")")
+        return 1
+    
+    def SetCurrentDirectoryW(self, args):
+        """SetCurrentDirectoryW emulation"""
+        lpPathName = args[0]
+        dirname = self.read_wide_string(lpPathName)
+        log.debug(f"SetCurrentDirectoryW(\"{dirname}\")")
+        return 1
+    
+    def FormatMessageA(self, args):
+        """FormatMessageA emulation"""
+        dwFlags = args[0]
+        lpSource = args[1]
+        dwMessageId = args[2]
+        dwLanguageId = args[3]
+        lpBuffer = args[4]
+        nSize = args[5]
+        
+        log.debug(f"FormatMessageA(flags=0x{dwFlags:x}, msgId={dwMessageId})")
+        
+        msg = f"Error {dwMessageId}\x00"
+        
+        # FORMAT_MESSAGE_ALLOCATE_BUFFER
+        if dwFlags & 0x00000100:
+            addr = self.emu.heap_alloc(256)
+            self.emu.uc.mem_write(addr, msg.encode('utf-8'))
+            self.emu.uc.mem_write(lpBuffer, struct.pack('<I', addr))
+        elif lpBuffer != 0:
+            self.emu.uc.mem_write(lpBuffer, msg.encode('utf-8'))
+        
+        return len(msg) - 1
+    
+    def FormatMessageW(self, args):
+        """FormatMessageW emulation"""
+        dwFlags = args[0]
+        lpSource = args[1]
+        dwMessageId = args[2]
+        dwLanguageId = args[3]
+        lpBuffer = args[4]
+        nSize = args[5]
+        
+        log.debug(f"FormatMessageW(flags=0x{dwFlags:x}, msgId={dwMessageId})")
+        
+        msg = f"Error {dwMessageId}"
+        msg_bytes = msg.encode('utf-16-le') + b'\x00\x00'
+        
+        if dwFlags & 0x00000100:
+            addr = self.emu.heap_alloc(512)
+            self.emu.uc.mem_write(addr, msg_bytes)
+            self.emu.uc.mem_write(lpBuffer, struct.pack('<I', addr))
+        elif lpBuffer != 0:
+            self.emu.uc.mem_write(lpBuffer, msg_bytes)
+        
+        return len(msg)
+    
+    def GetACP(self, args):
+        """GetACP emulation - Active Code Page"""
+        log.debug("GetACP() -> 1252")
+        return 1252  # Windows-1252 (Western European)
+    
+    def GetOEMCP(self, args):
+        """GetOEMCP emulation"""
+        log.debug("GetOEMCP() -> 437")
+        return 437  # OEM US
+    
+    def GetCPInfo(self, args):
+        """GetCPInfo emulation"""
+        CodePage = args[0]
+        lpCPInfo = args[1]
+        
+        log.debug(f"GetCPInfo({CodePage})")
+        
+        if lpCPInfo != 0:
+            # CPINFO structure: MaxCharSize (UINT), DefaultChar[2], LeadByte[12]
+            cp_info = struct.pack('<I', 1)  # MaxCharSize = 1 (single-byte)
+            cp_info += b'?\x00'  # DefaultChar
+            cp_info += b'\x00' * 12  # LeadByte (empty for single-byte)
+            self.emu.uc.mem_write(lpCPInfo, cp_info)
+        
+        return 1
+    
+    def IsValidCodePage(self, args):
+        """IsValidCodePage emulation"""
+        CodePage = args[0]
+        log.debug(f"IsValidCodePage({CodePage})")
+        valid_pages = {437, 850, 1252, 65001, 20127, 28591}
+        return 1 if CodePage in valid_pages else 0
+    
+    def IsDBCSLeadByte(self, args):
+        """IsDBCSLeadByte emulation"""
+        log.debug("IsDBCSLeadByte()")
+        return 0  # Not a DBCS lead byte
+    
+    def IsDBCSLeadByteEx(self, args):
+        """IsDBCSLeadByteEx emulation"""
+        log.debug("IsDBCSLeadByteEx()")
+        return 0
+    
+    def GetLocaleInfoA(self, args):
+        """GetLocaleInfoA emulation"""
+        Locale = args[0]
+        LCType = args[1]
+        lpLCData = args[2]
+        cchData = args[3]
+        
+        log.debug(f"GetLocaleInfoA(0x{Locale:x}, 0x{LCType:x})")
+        
+        # Return basic locale info
+        info = "English_United States.1252"
+        if cchData == 0:
+            return len(info) + 1
+        
+        if lpLCData != 0 and cchData > 0:
+            data = info[:cchData-1].encode('utf-8') + b'\x00'
+            self.emu.uc.mem_write(lpLCData, data)
+        
+        return min(len(info) + 1, cchData)
+    
+    def GetLocaleInfoW(self, args):
+        """GetLocaleInfoW emulation"""
+        Locale = args[0]
+        LCType = args[1]
+        lpLCData = args[2]
+        cchData = args[3]
+        
+        log.debug(f"GetLocaleInfoW(0x{Locale:x}, 0x{LCType:x})")
+        
+        info = "English_United States.1252"
+        if cchData == 0:
+            return len(info) + 1
+        
+        if lpLCData != 0 and cchData > 0:
+            data = info[:cchData-1].encode('utf-16-le') + b'\x00\x00'
+            self.emu.uc.mem_write(lpLCData, data)
+        
+        return min(len(info) + 1, cchData)
+    
+    def GetStringTypeA(self, args):
+        """GetStringTypeA emulation"""
+        log.debug("GetStringTypeA()")
+        return 1
+    
+    def GetStringTypeW(self, args):
+        """GetStringTypeW emulation"""
+        dwInfoType = args[0]
+        lpSrcStr = args[1]
+        cchSrc = args[2]
+        lpCharType = args[3]
+        
+        log.debug(f"GetStringTypeW(type={dwInfoType}, len={cchSrc})")
+        
+        if lpCharType != 0 and cchSrc > 0:
+            # CT_CTYPE1: write basic character type info
+            types = b'\x00\x00' * min(cchSrc, 256)
+            self.emu.uc.mem_write(lpCharType, types)
+        
+        return 1
+    
+    def LCMapStringA(self, args):
+        """LCMapStringA emulation"""
+        Locale = args[0]
+        dwMapFlags = args[1]
+        lpSrcStr = args[2]
+        cchSrc = args[3]
+        lpDestStr = args[4]
+        cchDest = args[5]
+        
+        log.debug(f"LCMapStringA(flags=0x{dwMapFlags:x})")
+        
+        if cchSrc == -1 or cchSrc == 0xFFFFFFFF:
+            src = self.read_string(lpSrcStr)
+        else:
+            data = self.emu.uc.mem_read(lpSrcStr, cchSrc)
+            src = data.decode('utf-8', errors='replace')
+        
+        # LCMAP_LOWERCASE
+        if dwMapFlags & 0x00000100:
+            result = src.lower()
+        # LCMAP_UPPERCASE
+        elif dwMapFlags & 0x00000200:
+            result = src.upper()
+        else:
+            result = src
+        
+        if cchDest == 0:
+            return len(result) + 1
+        
+        if lpDestStr != 0:
+            self.emu.uc.mem_write(lpDestStr, result.encode('utf-8') + b'\x00')
+        
+        return len(result) + 1
+    
+    def LCMapStringW(self, args):
+        """LCMapStringW emulation"""
+        Locale = args[0]
+        dwMapFlags = args[1]
+        lpSrcStr = args[2]
+        cchSrc = args[3]
+        lpDestStr = args[4]
+        cchDest = args[5]
+        
+        log.debug(f"LCMapStringW(flags=0x{dwMapFlags:x})")
+        
+        if cchSrc == -1 or cchSrc == 0xFFFFFFFF:
+            src = self.read_wide_string(lpSrcStr)
+        else:
+            data = self.emu.uc.mem_read(lpSrcStr, cchSrc * 2)
+            src = data.decode('utf-16-le', errors='replace')
+        
+        if dwMapFlags & 0x00000100:
+            result = src.lower()
+        elif dwMapFlags & 0x00000200:
+            result = src.upper()
+        else:
+            result = src
+        
+        if cchDest == 0:
+            return len(result) + 1
+        
+        if lpDestStr != 0:
+            self.emu.uc.mem_write(lpDestStr, result.encode('utf-16-le') + b'\x00\x00')
+        
+        return len(result) + 1
+    
+    def CompareStringA(self, args):
+        """CompareStringA emulation"""
+        Locale = args[0]
+        dwCmpFlags = args[1]
+        lpString1 = args[2]
+        cchCount1 = args[3]
+        lpString2 = args[4]
+        cchCount2 = args[5]
+        
+        s1 = self.read_string(lpString1)
+        s2 = self.read_string(lpString2)
+        
+        # NORM_IGNORECASE
+        if dwCmpFlags & 0x00000001:
+            s1, s2 = s1.lower(), s2.lower()
+        
+        if s1 < s2:
+            return 1  # CSTR_LESS_THAN
+        elif s1 > s2:
+            return 3  # CSTR_GREATER_THAN
+        return 2  # CSTR_EQUAL
+    
+    def CompareStringW(self, args):
+        """CompareStringW emulation"""
+        Locale = args[0]
+        dwCmpFlags = args[1]
+        lpString1 = args[2]
+        cchCount1 = args[3]
+        lpString2 = args[4]
+        cchCount2 = args[5]
+        
+        s1 = self.read_wide_string(lpString1)
+        s2 = self.read_wide_string(lpString2)
+        
+        if dwCmpFlags & 0x00000001:
+            s1, s2 = s1.lower(), s2.lower()
+        
+        if s1 < s2:
+            return 1
+        elif s1 > s2:
+            return 3
+        return 2
+    
+    def GetThreadLocale(self, args):
+        """GetThreadLocale emulation"""
+        log.debug("GetThreadLocale() -> 0x0409")
+        return 0x0409  # en-US
+    
+    def GetUserDefaultLCID(self, args):
+        """GetUserDefaultLCID emulation"""
+        log.debug("GetUserDefaultLCID() -> 0x0409")
+        return 0x0409  # en-US
+    
+    def GetUserDefaultUILanguage(self, args):
+        """GetUserDefaultUILanguage emulation"""
+        log.debug("GetUserDefaultUILanguage() -> 0x0409")
+        return 0x0409
+    
+    def IsValidLocale(self, args):
+        """IsValidLocale emulation"""
+        Locale = args[0]
+        log.debug(f"IsValidLocale(0x{Locale:x})")
+        return 1
+    
+    def EnumSystemLocalesA(self, args):
+        """EnumSystemLocalesA emulation"""
+        log.debug("EnumSystemLocalesA()")
+        return 1
+    
+    def IsProcessorFeaturePresent(self, args):
+        """IsProcessorFeaturePresent emulation"""
+        ProcessorFeature = args[0]
+        log.debug(f"IsProcessorFeaturePresent({ProcessorFeature})")
+        # PF_XMMI_INSTRUCTIONS_AVAILABLE (6) = SSE
+        # PF_XMMI64_INSTRUCTIONS_AVAILABLE (10) = SSE2
+        supported = {6, 10}
+        return 1 if ProcessorFeature in supported else 0
+    
+    def EncodePointer(self, args):
+        """EncodePointer emulation"""
+        Ptr = args[0]
+        return Ptr  # No-op encoding
+    
+    def DecodePointer(self, args):
+        """DecodePointer emulation"""
+        Ptr = args[0]
+        return Ptr  # No-op decoding
+    
+    def OutputDebugStringA(self, args):
+        """OutputDebugStringA emulation"""
+        lpOutputString = args[0]
+        if lpOutputString:
+            msg = self.read_string(lpOutputString)
+            log.debug(f"OutputDebugStringA(\"{msg[:64]}\")")
+        return 0
+    
+    def OutputDebugStringW(self, args):
+        """OutputDebugStringW emulation"""
+        lpOutputString = args[0]
+        if lpOutputString:
+            msg = self.read_wide_string(lpOutputString)
+            log.debug(f"OutputDebugStringW(\"{msg[:64]}\")")
+        return 0
+    
+    def SetHandleCount(self, args):
+        """SetHandleCount emulation"""
+        uNumber = args[0]
+        log.debug(f"SetHandleCount({uNumber})")
+        return uNumber
+    
+    def SetStdHandle(self, args):
+        """SetStdHandle emulation"""
+        nStdHandle = args[0]
+        hHandle = args[1]
+        log.debug(f"SetStdHandle(0x{nStdHandle:x}, 0x{hHandle:x})")
+        return 1
+    
+    def IsBadReadPtr(self, args):
+        """IsBadReadPtr emulation"""
+        lp = args[0]
+        ucb = args[1]
+        if lp == 0:
+            return 1  # Bad pointer
+        return 0  # Good pointer
+    
+    def IsBadWritePtr(self, args):
+        """IsBadWritePtr emulation"""
+        lp = args[0]
+        ucb = args[1]
+        if lp == 0:
+            return 1
+        return 0
+    
+    def IsBadCodePtr(self, args):
+        """IsBadCodePtr emulation"""
+        lpfn = args[0]
+        if lpfn == 0:
+            return 1
+        return 0
+    
+    def Beep(self, args):
+        """Beep emulation"""
+        dwFreq = args[0]
+        dwDuration = args[1]
+        log.debug(f"Beep({dwFreq}Hz, {dwDuration}ms)")
+        return 1
+    
+    def MulDiv(self, args):
+        """MulDiv emulation"""
+        nNumber = args[0]
+        nNumerator = args[1]
+        nDenominator = args[2]
+        
+        # Convert to signed
+        if nNumber > 0x7FFFFFFF:
+            nNumber -= 0x100000000
+        if nNumerator > 0x7FFFFFFF:
+            nNumerator -= 0x100000000
+        if nDenominator > 0x7FFFFFFF:
+            nDenominator -= 0x100000000
+        
+        if nDenominator == 0:
+            return -1
+        
+        result = (nNumber * nNumerator + nDenominator // 2) // nDenominator
+        return result & 0xFFFFFFFF
+    
+    def DuplicateHandle(self, args):
+        """DuplicateHandle emulation"""
+        hSourceProcessHandle = args[0]
+        hSourceHandle = args[1]
+        hTargetProcessHandle = args[2]
+        lpTargetHandle = args[3]
+        dwDesiredAccess = args[4]
+        bInheritHandle = args[5]
+        dwOptions = args[6]
+        
+        log.debug(f"DuplicateHandle(0x{hSourceHandle:x})")
+        
+        new_handle = self.get_next_handle()
+        if lpTargetHandle != 0:
+            self.emu.uc.mem_write(lpTargetHandle, struct.pack('<I', new_handle))
+        
+        return 1
+    
+    def GetEnvironmentStringsW(self, args):
+        """GetEnvironmentStringsW emulation"""
+        log.debug("GetEnvironmentStringsW()")
+        
+        if self._env_strings_w_addr == 0:
+            env_vars = [
+                "PATH=C:\\Windows\\System32;C:\\Windows",
+                "TEMP=C:\\Windows\\Temp",
+                "TMP=C:\\Windows\\Temp",
+                "WINDIR=C:\\Windows",
+                "SYSTEMROOT=C:\\Windows",
+                "COMSPEC=C:\\Windows\\System32\\cmd.exe",
+            ]
+            
+            data = b''
+            for var in env_vars:
+                data += var.encode('utf-16-le') + b'\x00\x00'
+            data += b'\x00\x00'  # Double null terminator
+            
+            self._env_strings_w_addr = self.emu.heap_alloc(len(data))
+            self.emu.uc.mem_write(self._env_strings_w_addr, data)
+        
+        return self._env_strings_w_addr
+    
+    def GetEnvironmentStrings(self, args):
+        """GetEnvironmentStrings (ANSI) emulation"""
+        log.debug("GetEnvironmentStrings()")
+        
+        if self._env_strings_addr == 0:
+            env_vars = [
+                "PATH=C:\\Windows\\System32;C:\\Windows",
+                "TEMP=C:\\Windows\\Temp",
+                "TMP=C:\\Windows\\Temp",
+                "WINDIR=C:\\Windows",
+                "SYSTEMROOT=C:\\Windows",
+            ]
+            
+            data = b''
+            for var in env_vars:
+                data += var.encode('utf-8') + b'\x00'
+            data += b'\x00'
+            
+            self._env_strings_addr = self.emu.heap_alloc(len(data))
+            self.emu.uc.mem_write(self._env_strings_addr, data)
+        
+        return self._env_strings_addr
+    
+    def FreeEnvironmentStringsA(self, args):
+        """FreeEnvironmentStringsA emulation"""
+        log.debug("FreeEnvironmentStringsA()")
+        return 1
+    
+    def FreeEnvironmentStringsW(self, args):
+        """FreeEnvironmentStringsW emulation"""
+        log.debug("FreeEnvironmentStringsW()")
+        return 1
+    
+    def SetEnvironmentVariableA(self, args):
+        """SetEnvironmentVariableA emulation"""
+        lpName = args[0]
+        lpValue = args[1]
+        name = self.read_string(lpName) if lpName else ""
+        value = self.read_string(lpValue) if lpValue else ""
+        log.debug(f"SetEnvironmentVariableA(\"{name}\", \"{value}\")")
+        return 1
+    
+    def SetEnvironmentVariableW(self, args):
+        """SetEnvironmentVariableW emulation"""
+        log.debug("SetEnvironmentVariableW()")
+        return 1
+    
+    def GetEnvironmentVariableW(self, args):
+        """GetEnvironmentVariableW emulation"""
+        lpName = args[0]
+        lpBuffer = args[1]
+        nSize = args[2]
+        
+        name = self.read_wide_string(lpName)
+        log.debug(f"GetEnvironmentVariableW(\"{name}\")")
+        
+        env_vars = {
+            'PATH': 'C:\\Windows\\System32;C:\\Windows',
+            'TEMP': 'C:\\Windows\\Temp',
+            'TMP': 'C:\\Windows\\Temp',
+            'WINDIR': 'C:\\Windows',
+            'SYSTEMROOT': 'C:\\Windows',
+        }
+        
+        value = env_vars.get(name.upper(), '')
+        if value and lpBuffer != 0 and len(value) < nSize:
+            self.emu.uc.mem_write(lpBuffer, value.encode('utf-16-le') + b'\x00\x00')
+            return len(value)
+        
+        return 0
+    
+    def CreateMutexA(self, args):
+        """CreateMutexA emulation"""
+        lpMutexAttributes = args[0]
+        bInitialOwner = args[1]
+        lpName = args[2]
+        
+        name = self.read_string(lpName) if lpName else ""
+        log.debug(f"CreateMutexA(\"{name}\")")
+        
+        handle = self.get_next_handle()
+        self.mutexes[handle] = {'name': name}
+        return handle
+    
+    def OpenMutexA(self, args):
+        """OpenMutexA emulation"""
+        log.debug("OpenMutexA()")
+        return 0  # Not found
+    
+    def WaitForSingleObject(self, args):
+        """WaitForSingleObject emulation"""
+        hHandle = args[0]
+        dwMilliseconds = args[1]
+        log.debug(f"WaitForSingleObject(0x{hHandle:x}, {dwMilliseconds}ms)")
+        return 0  # WAIT_OBJECT_0
+    
+    def WaitForMultipleObjects(self, args):
+        """WaitForMultipleObjects emulation"""
+        nCount = args[0]
+        lpHandles = args[1]
+        bWaitAll = args[2]
+        dwMilliseconds = args[3]
+        log.debug(f"WaitForMultipleObjects({nCount})")
+        return 0  # WAIT_OBJECT_0
+    
+    def CreateEventA(self, args):
+        """CreateEventA emulation"""
+        lpEventAttributes = args[0]
+        bManualReset = args[1]
+        bInitialState = args[2]
+        lpName = args[3]
+        
+        name = self.read_string(lpName) if lpName else ""
+        log.debug(f"CreateEventA(\"{name}\", manual={bManualReset}, initial={bInitialState})")
+        
+        handle = self.get_next_handle()
+        self.events[handle] = {
+            'manual_reset': bool(bManualReset),
+            'signaled': bool(bInitialState),
+            'name': name,
+        }
+        return handle
+    
+    def SetEvent(self, args):
+        """SetEvent emulation"""
+        hEvent = args[0]
+        log.debug(f"SetEvent(0x{hEvent:x})")
+        if hEvent in self.events:
+            self.events[hEvent]['signaled'] = True
+        return 1
+    
+    def ResetEvent(self, args):
+        """ResetEvent emulation"""
+        hEvent = args[0]
+        log.debug(f"ResetEvent(0x{hEvent:x})")
+        if hEvent in self.events:
+            self.events[hEvent]['signaled'] = False
+        return 1
+    
+    def PulseEvent(self, args):
+        """PulseEvent emulation"""
+        hEvent = args[0]
+        log.debug(f"PulseEvent(0x{hEvent:x})")
+        return 1
+    
+    def CreateThread(self, args):
+        """CreateThread emulation"""
+        lpThreadAttributes = args[0]
+        dwStackSize = args[1]
+        lpStartAddress = args[2]
+        lpParameter = args[3]
+        dwCreationFlags = args[4]
+        lpThreadId = args[5]
+        
+        log.debug(f"CreateThread(func=0x{lpStartAddress:08x}, param=0x{lpParameter:08x})")
+        
+        handle = self.get_next_handle()
+        tid = self.next_thread_id
+        self.next_thread_id += 1
+        
+        self.threads[handle] = {
+            'func': lpStartAddress,
+            'param': lpParameter,
+            'id': tid,
+        }
+        
+        if lpThreadId != 0:
+            self.emu.uc.mem_write(lpThreadId, struct.pack('<I', tid))
+        
+        return handle
+    
+    def ResumeThread(self, args):
+        """ResumeThread emulation"""
+        hThread = args[0]
+        log.debug(f"ResumeThread(0x{hThread:x})")
+        return 0  # Previous suspend count
+    
+    def ExitThread(self, args):
+        """ExitThread emulation"""
+        dwExitCode = args[0]
+        log.debug(f"ExitThread({dwExitCode})")
+        return 0
+    
+    def TerminateProcess(self, args):
+        """TerminateProcess emulation"""
+        hProcess = args[0]
+        uExitCode = args[1]
+        log.debug(f"TerminateProcess(0x{hProcess:x}, {uExitCode})")
+        self.emu.stop_emulation = True
+        return 1
+    
+    def TerminateThread(self, args):
+        """TerminateThread emulation"""
+        log.debug("TerminateThread()")
+        return 1
+    
+    def GetExitCodeProcess(self, args):
+        """GetExitCodeProcess emulation"""
+        hProcess = args[0]
+        lpExitCode = args[1]
+        if lpExitCode != 0:
+            self.emu.uc.mem_write(lpExitCode, struct.pack('<I', 0))
+        return 1
+    
+    def SleepEx(self, args):
+        """SleepEx emulation"""
+        dwMilliseconds = args[0]
+        bAlertable = args[1]
+        log.debug(f"SleepEx({dwMilliseconds}ms)")
+        return 0
+    
+    def GetConsoleMode(self, args):
+        """GetConsoleMode emulation"""
+        hConsoleHandle = args[0]
+        lpMode = args[1]
+        
+        if lpMode != 0:
+            self.emu.uc.mem_write(lpMode, struct.pack('<I', self._console_mode))
+        
+        log.debug(f"GetConsoleMode(0x{hConsoleHandle:x})")
+        return 1
+    
+    def SetConsoleMode(self, args):
+        """SetConsoleMode emulation"""
+        hConsoleHandle = args[0]
+        dwMode = args[1]
+        self._console_mode = dwMode
+        log.debug(f"SetConsoleMode(0x{hConsoleHandle:x}, 0x{dwMode:x})")
+        return 1
+    
+    def SetConsoleCtrlHandler(self, args):
+        """SetConsoleCtrlHandler emulation"""
+        HandlerRoutine = args[0]
+        Add = args[1]
+        log.debug(f"SetConsoleCtrlHandler(0x{HandlerRoutine:08x}, {Add})")
+        return 1
+    
+    def GetConsoleOutputCP(self, args):
+        """GetConsoleOutputCP emulation"""
+        log.debug("GetConsoleOutputCP() -> 437")
+        return 437
+    
+    def GetConsoleScreenBufferInfo(self, args):
+        """GetConsoleScreenBufferInfo emulation"""
+        hConsoleOutput = args[0]
+        lpConsoleScreenBufferInfo = args[1]
+        
+        if lpConsoleScreenBufferInfo != 0:
+            # CONSOLE_SCREEN_BUFFER_INFO
+            info = struct.pack('<HH HH H hhhh',
+                80, 25,    # dwSize (cols, rows)
+                0, 0,      # dwCursorPosition
+                7,         # wAttributes (default)
+                0, 0, 79, 24,  # srWindow (left, top, right, bottom)
+            )
+            # dwMaximumWindowSize
+            info += struct.pack('<HH', 80, 25)
+            self.emu.uc.mem_write(lpConsoleScreenBufferInfo, info)
+        
+        return 1
+    
+    def GetNumberOfConsoleInputEvents(self, args):
+        """GetNumberOfConsoleInputEvents emulation"""
+        hConsoleInput = args[0]
+        lpcNumberOfEvents = args[1]
+        if lpcNumberOfEvents != 0:
+            self.emu.uc.mem_write(lpcNumberOfEvents, struct.pack('<I', 0))
+        return 1
+    
+    def PeekConsoleInputA(self, args):
+        """PeekConsoleInputA emulation"""
+        log.debug("PeekConsoleInputA()")
+        return 1
+    
+    def ReadConsoleInputA(self, args):
+        """ReadConsoleInputA emulation"""
+        log.debug("ReadConsoleInputA()")
+        return 0
+    
+    def WriteConsoleW(self, args):
+        """WriteConsoleW emulation"""
+        hConsoleOutput = args[0]
+        lpBuffer = args[1]
+        nNumberOfCharsToWrite = args[2]
+        lpNumberOfCharsWritten = args[3]
+        
+        try:
+            data = self.emu.uc.mem_read(lpBuffer, nNumberOfCharsToWrite * 2)
+            text = data.decode('utf-16-le', errors='replace')
+            print(f"{Fore.YELLOW}[CONSOLE]{Style.RESET_ALL} {text}", end='')
+            self.console_output.append(text)
+            
+            if self.gui and self.gui.running:
+                self.gui.console_write_stdout(text)
+            
+            if lpNumberOfCharsWritten != 0:
+                self.emu.uc.mem_write(lpNumberOfCharsWritten,
+                                      struct.pack('<I', nNumberOfCharsToWrite))
+            return 1
+        except Exception as e:
+            log.error(f"WriteConsoleW error: {e}")
+            return 0
+    
+    def CreateFileW(self, args):
+        """CreateFileW emulation"""
+        lpFileName = args[0]
+        dwDesiredAccess = args[1]
+        
+        filename = self.read_wide_string(lpFileName)
+        log.debug(f"CreateFileW(\"{filename}\")")
+        
+        handle = self.get_next_handle()
+        self.handles[handle] = {'type': 'file', 'name': filename}
+        return handle
+    
+    def GetFileAttributesW(self, args):
+        """GetFileAttributesW emulation"""
+        lpFileName = args[0]
+        filename = self.read_wide_string(lpFileName)
+        log.debug(f"GetFileAttributesW(\"{filename}\")")
+        return 0xFFFFFFFF  # INVALID_FILE_ATTRIBUTES
+    
+    def SetFileAttributesA(self, args):
+        """SetFileAttributesA emulation"""
+        log.debug("SetFileAttributesA()")
+        return 1
+    
+    def SetFileAttributesW(self, args):
+        """SetFileAttributesW emulation"""
+        log.debug("SetFileAttributesW()")
+        return 1
+    
+    def GetFileTime(self, args):
+        """GetFileTime emulation"""
+        log.debug("GetFileTime()")
+        return 1
+    
+    def SetFileTime(self, args):
+        """SetFileTime emulation"""
+        log.debug("SetFileTime()")
+        return 1
+    
+    def GetFileInformationByHandle(self, args):
+        """GetFileInformationByHandle emulation"""
+        log.debug("GetFileInformationByHandle()")
+        return 0  # Failure
+    
+    def GetDiskFreeSpaceA(self, args):
+        """GetDiskFreeSpaceA emulation"""
+        log.debug("GetDiskFreeSpaceA()")
+        return 1
+    
+    def CreateFileMappingA(self, args):
+        """CreateFileMappingA emulation"""
+        log.debug("CreateFileMappingA()")
+        return self.get_next_handle()
+    
+    def CreatePipe(self, args):
+        """CreatePipe emulation"""
+        hReadPipe = args[0]
+        hWritePipe = args[1]
+        
+        read_handle = self.get_next_handle()
+        write_handle = self.get_next_handle()
+        
+        if hReadPipe != 0:
+            self.emu.uc.mem_write(hReadPipe, struct.pack('<I', read_handle))
+        if hWritePipe != 0:
+            self.emu.uc.mem_write(hWritePipe, struct.pack('<I', write_handle))
+        
+        log.debug("CreatePipe()")
+        return 1
+    
+    def PeekNamedPipe(self, args):
+        """PeekNamedPipe emulation"""
+        log.debug("PeekNamedPipe()")
+        return 0
+    
+    def SetPriorityClass(self, args):
+        """SetPriorityClass emulation"""
+        log.debug("SetPriorityClass()")
+        return 1
+    
+    def DisableThreadLibraryCalls(self, args):
+        """DisableThreadLibraryCalls emulation"""
+        log.debug("DisableThreadLibraryCalls()")
+        return 1
+    
+    def GetModuleHandleExW(self, args):
+        """GetModuleHandleExW emulation"""
+        dwFlags = args[0]
+        lpModuleName = args[1]
+        phModule = args[2]
+        log.debug("GetModuleHandleExW()")
+        if phModule != 0:
+            self.emu.uc.mem_write(phModule, struct.pack('<I', self.emu.pe_loader.image_base))
+        return 1
+    
+    def GetSystemTime(self, args):
+        """GetSystemTime emulation"""
+        lpSystemTime = args[0]
+        
+        import datetime
+        now = datetime.datetime.utcnow()
+        
+        if lpSystemTime != 0:
+            st = struct.pack('<HHHHHHHH',
+                now.year, now.month, now.weekday(),
+                now.day, now.hour, now.minute,
+                now.second, now.microsecond // 1000)
+            self.emu.uc.mem_write(lpSystemTime, st)
+        
+        log.debug("GetSystemTime()")
+        return 0
+    
+    def GetLocalTime(self, args):
+        """GetLocalTime emulation"""
+        lpSystemTime = args[0]
+        
+        import datetime
+        now = datetime.datetime.now()
+        
+        if lpSystemTime != 0:
+            st = struct.pack('<HHHHHHHH',
+                now.year, now.month, now.weekday(),
+                now.day, now.hour, now.minute,
+                now.second, now.microsecond // 1000)
+            self.emu.uc.mem_write(lpSystemTime, st)
+        
+        log.debug("GetLocalTime()")
+        return 0
+    
+    def SetLocalTime(self, args):
+        """SetLocalTime emulation"""
+        log.debug("SetLocalTime()")
+        return 1
+    
+    def GetTimeZoneInformation(self, args):
+        """GetTimeZoneInformation emulation"""
+        lpTimeZoneInformation = args[0]
+        log.debug("GetTimeZoneInformation()")
+        
+        if lpTimeZoneInformation != 0:
+            self.emu.uc.mem_write(lpTimeZoneInformation, b'\x00' * 172)
+        
+        return 0  # TIME_ZONE_ID_UNKNOWN
+    
+    def FileTimeToSystemTime(self, args):
+        """FileTimeToSystemTime emulation"""
+        log.debug("FileTimeToSystemTime()")
+        return 1
+    
+    def SystemTimeToFileTime(self, args):
+        """SystemTimeToFileTime emulation"""
+        log.debug("SystemTimeToFileTime()")
+        return 1
+    
+    def FileTimeToLocalFileTime(self, args):
+        """FileTimeToLocalFileTime emulation"""
+        lpFileTime = args[0]
+        lpLocalFileTime = args[1]
+        if lpFileTime != 0 and lpLocalFileTime != 0:
+            data = self.emu.uc.mem_read(lpFileTime, 8)
+            self.emu.uc.mem_write(lpLocalFileTime, bytes(data))
+        return 1
+    
+    def LocalFileTimeToFileTime(self, args):
+        """LocalFileTimeToFileTime emulation"""
+        lpLocalFileTime = args[0]
+        lpFileTime = args[1]
+        if lpLocalFileTime != 0 and lpFileTime != 0:
+            data = self.emu.uc.mem_read(lpLocalFileTime, 8)
+            self.emu.uc.mem_write(lpFileTime, bytes(data))
+        return 1
+    
+    def FileTimeToDosDateTime(self, args):
+        """FileTimeToDosDateTime emulation"""
+        log.debug("FileTimeToDosDateTime()")
+        return 1
+    
+    def GlobalAddAtomA(self, args):
+        """GlobalAddAtomA emulation"""
+        lpString = args[0]
+        name = self.read_string(lpString) if lpString else ""
+        atom = self.next_atom
+        self.next_atom += 1
+        log.debug(f"GlobalAddAtomA(\"{name}\") -> 0x{atom:x}")
+        return atom
+    
+    def GlobalReAlloc(self, args):
+        """GlobalReAlloc emulation"""
+        hMem = args[0]
+        dwBytes = args[1]
+        uFlags = args[2]
+        addr = self.emu.heap_alloc(dwBytes)
+        log.debug(f"GlobalReAlloc(0x{hMem:08x}, {dwBytes}) -> 0x{addr:08x}")
+        return addr
+    
+    def GlobalSize(self, args):
+        """GlobalSize emulation"""
+        hMem = args[0]
+        log.debug(f"GlobalSize(0x{hMem:08x})")
+        return 0x1000
+    
+    def GlobalFlags(self, args):
+        """GlobalFlags emulation"""
+        log.debug("GlobalFlags()")
+        return 0
+    
+    def GlobalHandle(self, args):
+        """GlobalHandle emulation"""
+        pMem = args[0]
+        return pMem
+    
+    def InitializeSListHead(self, args):
+        """InitializeSListHead emulation"""
+        ListHead = args[0]
+        if ListHead != 0:
+            self.emu.uc.mem_write(ListHead, b'\x00' * 8)
+        log.debug("InitializeSListHead()")
+        return 0
+    
+    def InitOnceBeginInitialize(self, args):
+        """InitOnceBeginInitialize emulation"""
+        log.debug("InitOnceBeginInitialize()")
+        return 1
+    
+    def InitOnceComplete(self, args):
+        """InitOnceComplete emulation"""
+        log.debug("InitOnceComplete()")
+        return 1
+    
+    def AcquireSRWLockExclusive(self, args):
+        """AcquireSRWLockExclusive emulation"""
+        log.debug("AcquireSRWLockExclusive()")
+        return 0
+    
+    def AcquireSRWLockShared(self, args):
+        """AcquireSRWLockShared emulation"""
+        log.debug("AcquireSRWLockShared()")
+        return 0
+    
+    def ReleaseSRWLockExclusive(self, args):
+        """ReleaseSRWLockExclusive emulation"""
+        log.debug("ReleaseSRWLockExclusive()")
+        return 0
+    
+    def ReleaseSRWLockShared(self, args):
+        """ReleaseSRWLockShared emulation"""
+        log.debug("ReleaseSRWLockShared()")
+        return 0
+    
+    def TryAcquireSRWLockExclusive(self, args):
+        """TryAcquireSRWLockExclusive emulation"""
+        log.debug("TryAcquireSRWLockExclusive()")
+        return 1  # Success
+    
+    def AddVectoredExceptionHandler(self, args):
+        """AddVectoredExceptionHandler emulation"""
+        log.debug("AddVectoredExceptionHandler()")
+        return self.get_next_handle()
+    
+    def SetUnhandledExceptionFilter(self, args):
+        """SetUnhandledExceptionFilter emulation"""
+        lpTopLevelExceptionFilter = args[0]
+        log.debug(f"SetUnhandledExceptionFilter(0x{lpTopLevelExceptionFilter:08x})")
+        return 0  # Previous filter
+    
+    def UnhandledExceptionFilter(self, args):
+        """UnhandledExceptionFilter emulation"""
+        log.debug("UnhandledExceptionFilter()")
+        return 1  # EXCEPTION_EXECUTE_HANDLER
+    
+    def RaiseException(self, args):
+        """RaiseException emulation"""
+        dwExceptionCode = args[0]
+        log.debug(f"RaiseException(0x{dwExceptionCode:08x})")
+        return 0
+    
+    def RtlUnwind(self, args):
+        """RtlUnwind emulation"""
+        log.debug("RtlUnwind()")
+        return 0
+    
+    def GetTempPathW(self, args):
+        """GetTempPathW emulation"""
+        nBufferLength = args[0]
+        lpBuffer = args[1]
+        
+        temp_path = "C:\\Windows\\Temp\\"
+        if len(temp_path) < nBufferLength and lpBuffer != 0:
+            self.emu.uc.mem_write(lpBuffer, temp_path.encode('utf-16-le') + b'\x00\x00')
+        
+        log.debug(f"GetTempPathW() -> \"{temp_path}\"")
+        return len(temp_path)
+    
+    def lstrcpyW(self, args):
+        """lstrcpyW emulation"""
+        lpString1 = args[0]
+        lpString2 = args[1]
+        
+        src = self.read_wide_string(lpString2)
+        self.emu.uc.mem_write(lpString1, src.encode('utf-16-le') + b'\x00\x00')
+        
+        log.debug(f"lstrcpyW()")
+        return lpString1
+    
+    def GetPrivateProfileStringA(self, args):
+        """GetPrivateProfileStringA emulation"""
+        lpAppName = args[0]
+        lpKeyName = args[1]
+        lpDefault = args[2]
+        lpReturnedString = args[3]
+        nSize = args[4]
+        
+        default_val = self.read_string(lpDefault) if lpDefault else ""
+        
+        if lpReturnedString != 0 and nSize > 0:
+            result = default_val[:nSize-1]
+            self.emu.uc.mem_write(lpReturnedString, result.encode('utf-8') + b'\x00')
+        
+        log.debug("GetPrivateProfileStringA()")
+        return len(default_val)
+    
+    def GetPrivateProfileIntA(self, args):
+        """GetPrivateProfileIntA emulation"""
+        lpAppName = args[0]
+        lpKeyName = args[1]
+        nDefault = args[2]
+        log.debug("GetPrivateProfileIntA()")
+        return nDefault
+    
+    def WritePrivateProfileStringA(self, args):
+        """WritePrivateProfileStringA emulation"""
+        log.debug("WritePrivateProfileStringA()")
+        return 1
+    
+    def FindResourceA(self, args):
+        """FindResourceA emulation"""
+        log.debug("FindResourceA()")
+        return 0
+    
+    def FindResourceW(self, args):
+        """FindResourceW emulation"""
+        log.debug("FindResourceW()")
+        return 0
+    
+    def LoadResource(self, args):
+        """LoadResource emulation"""
+        log.debug("LoadResource()")
+        return 0
+    
+    def LockResource(self, args):
+        """LockResource emulation"""
+        log.debug("LockResource()")
+        return 0
+    
+    def SizeofResource(self, args):
+        """SizeofResource emulation"""
+        log.debug("SizeofResource()")
+        return 0
+    
+    def FreeResource(self, args):
+        """FreeResource emulation"""
+        log.debug("FreeResource()")
+        return 0
     def GetSystemMetrics(self, args):
         """GetSystemMetrics emulation"""
         nIndex = args[0]
