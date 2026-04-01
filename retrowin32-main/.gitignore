@@ -1,0 +1,15 @@
+/target
+/deploy
+
+# mac so annoying
+.DS_Store
+
+# ghidra
+*.gpr
+*.rep
+*.lock*
+
+# Visual Studio (for use in profiling)
+/.vs
+# For running on Windows
+/SDL2.dll

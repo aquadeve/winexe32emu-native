@@ -1,0 +1,8 @@
+category = "retrowin32 test"
+title = "callback test"
+desc = "tests x86 calling Windows calling x86"
+cmdline = "local/exe/callback/callback.exe"
+
+[origin]
+desc = "retrowin32"
+url = "https://github.com/evmar/retrowin32/tree/main/exe/callback"

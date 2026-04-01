@@ -1,0 +1,9 @@
+title = "kill the clone"
+dir = "archive/demo/"
+cmdline = "kill the clone unpacked.exe"
+category = "demoscene"
+broken = true
+
+[origin]
+desc = "pouet.net"
+url = "https://www.pouet.net/prod.php?which=2017"

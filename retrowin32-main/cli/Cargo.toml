@@ -1,0 +1,27 @@
+[package]
+name = "retrowin32"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { workspace = true }
+log = { workspace = true }
+memory = { workspace = true }
+pe = { workspace = true }
+win32 = { workspace = true }
+
+anyhow = "1.0"
+argh = { version = "0.1.13", default-features = false, features = ["help"] }
+libc = { version = "0.2", optional = true }
+
+[dependencies.sdl2]
+version = "0.35.2"
+features = ["unsafe_textures"]
+optional = true
+
+[features]
+default = ["x86-emu", "sdl"]
+sdl = ["dep:sdl2"]
+x86-emu = ["win32/x86-emu"]
+x86-64 = ["win32/x86-64", "dep:libc"]
+x86-unicorn = ["win32/x86-unicorn"]

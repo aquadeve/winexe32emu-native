@@ -1,0 +1,8 @@
+category = "retrowin32 test"
+title = "DirectDraw spinning car"
+desc = "simplest DirectDraw app"
+cmdline = "archive/BasicDD.exe"
+
+[origin]
+desc = "DirectDraw tutorial"
+url = "https://www.codeproject.com/Articles/2370/Introduction-to-DirectDraw-and-Surface-Blitting"
