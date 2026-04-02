@@ -412,6 +412,12 @@ class WinAPIHandler:
             '_controlfp_s': self.api_controlfp_s,
             '_configthreadlocale': self.api_configthreadlocale,
             '_EH_prolog': self.api_EH_prolog,
+            # Operator functions
+            '??2@YAPAXI@Z': self.operator_new,    # operator new
+            '??3@YAXPAX@Z': self.operator_delete,  # operator delete
+            '??_V@YAXPAX@Z': self.operator_delete,  # operator delete[]
+            # time() function
+            'time': self.time_func,
         }
     
     def get_api_handler(self, func_name):
