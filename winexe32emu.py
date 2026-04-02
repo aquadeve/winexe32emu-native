@@ -287,6 +287,9 @@ class PELoader:
 class WinAPIHandler:
     """Windows API emulation"""
     
+    # Window creation constant
+    CW_USEDEFAULT = 0x80000000
+    
     # Windows message constants
     WM_CREATE = 0x0001
     WM_DESTROY = 0x0002
@@ -1577,10 +1580,10 @@ class WinAPIHandler:
         dwBytes = args[3]
         
         addr = self.emu.heap_alloc(dwBytes)
-        # Copy old data if possible
-        if lpMem != 0:
+        # Copy old data to new allocation (copy up to the new size)
+        if lpMem != 0 and dwBytes > 0:
             try:
-                old_data = self.emu.uc.mem_read(lpMem, min(dwBytes, 4096))
+                old_data = self.emu.uc.mem_read(lpMem, dwBytes)
                 self.emu.uc.mem_write(addr, bytes(old_data))
             except:
                 pass
@@ -1754,6 +1757,18 @@ class WinAPIHandler:
             full_path = "C:\\" + filename
         else:
             full_path = filename
+        
+        # Normalize path (collapse .. and . segments within emulated filesystem)
+        full_path = full_path.replace('/', '\\')
+        parts = full_path.split('\\')
+        normalized = []
+        for part in parts:
+            if part == '..':
+                if len(normalized) > 1:  # Keep at least drive letter
+                    normalized.pop()
+            elif part != '.':
+                normalized.append(part)
+        full_path = '\\'.join(normalized)
         
         if lpBuffer != 0 and len(full_path) < nBufferLength:
             self.emu.uc.mem_write(lpBuffer, full_path.encode('utf-8') + b'\x00')
@@ -3036,10 +3051,10 @@ class WinAPIHandler:
         lpClassName = args[1]
         lpWindowName = args[2]
         dwStyle = args[3]
-        x = args[4] if args[4] != 0x80000000 else 100  # CW_USEDEFAULT
-        y = args[5] if args[5] != 0x80000000 else 100
-        nWidth = args[6] if args[6] != 0x80000000 else 400
-        nHeight = args[7] if args[7] != 0x80000000 else 300
+        x = args[4] if args[4] != self.CW_USEDEFAULT else 100
+        y = args[5] if args[5] != self.CW_USEDEFAULT else 100
+        nWidth = args[6] if args[6] != self.CW_USEDEFAULT else 400
+        nHeight = args[7] if args[7] != self.CW_USEDEFAULT else 300
         hWndParent = args[8]
         hMenu = args[9]
         hInstance = args[10]
@@ -4203,10 +4218,10 @@ class WinAPIHandler:
         lpClassName = args[1]
         lpWindowName = args[2]
         dwStyle = args[3]
-        x = args[4] if args[4] != 0x80000000 else 100
-        y = args[5] if args[5] != 0x80000000 else 100
-        nWidth = args[6] if args[6] != 0x80000000 else 400
-        nHeight = args[7] if args[7] != 0x80000000 else 300
+        x = args[4] if args[4] != self.CW_USEDEFAULT else 100
+        y = args[5] if args[5] != self.CW_USEDEFAULT else 100
+        nWidth = args[6] if args[6] != self.CW_USEDEFAULT else 400
+        nHeight = args[7] if args[7] != self.CW_USEDEFAULT else 300
         hWndParent = args[8]
         hMenu = args[9]
         hInstance = args[10]
